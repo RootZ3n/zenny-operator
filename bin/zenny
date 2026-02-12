@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${DOBBY_STATE_DIR:-/media/zen/AI/dobby-operator/state}"
+
+usage() {
+  cat <<USAGE
+zenny - minimal job gate
+
+Env:
+  DOBBY_STATE_DIR   (default: /media/zen/AI/dobby-operator/state)
+
+Commands:
+  zenny status
+  zenny jobs list
+  zenny jobs new <id> <title>
+  zenny jobs approve <id>
+  zenny run <id>    (refuses unless approved)
+USAGE
+}
+
+must_state() {
+  if [ ! -d "$STATE_DIR" ]; then
+    echo "❌ DOBBY_STATE_DIR not found: $STATE_DIR" >&2
+    exit 1
+  fi
+  mkdir -p "$STATE_DIR"/{jobs/{inbox,proposed,approved,running,done,failed},artifacts/{bundles,reports,patches},logs/runs}
+}
+
+cmd_status() {
+  must_state
+  echo "STATE_DIR=$STATE_DIR"
+  for d in inbox proposed approved running done failed; do
+    c=$(find "$STATE_DIR/jobs/$d" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
+    echo "jobs/$d: $c"
+  done
+}
+
+cmd_jobs_list() {
+  must_state
+  for d in inbox proposed approved running done failed; do
+    echo "== $d =="
+    ls -1 "$STATE_DIR/jobs/$d" 2>/dev/null || true
+    echo
+  done
+}
+
+cmd_jobs_new() {
+  must_state
+  local id="${1:-}"
+  shift || true
+  local title="${*:-}"
+  if [ -z "$id" ] || [ -z "$title" ]; then
+    echo "❌ usage: zenny jobs new <id> <title>" >&2
+    exit 1
+  fi
+  local f="$STATE_DIR/jobs/inbox/${id}.md"
+  if [ -e "$f" ]; then
+    echo "❌ job already exists: $f" >&2
+    exit 1
+  fi
+  cat > "$f" <<MD
+# Job ${id} — ${title}
+
+Goal:
+
+Rules:
+- Propose only unless approved.
+- No marketplace installs.
+- No secrets in logs/artifacts.
+
+Deliverables:
+
+Notes:
+MD
+  echo "✅ created: $f"
+}
+
+cmd_jobs_approve() {
+  must_state
+  local id="${1:-}"
+  if [ -z "$id" ]; then
+    echo "❌ usage: zenny jobs approve <id>" >&2
+    exit 1
+  fi
+  local src=""
+  for d in inbox proposed; do
+    if [ -f "$STATE_DIR/jobs/$d/${id}.md" ]; then
+      src="$STATE_DIR/jobs/$d/${id}.md"
+      break
+    fi
+  done
+  if [ -z "$src" ]; then
+    echo "❌ job not found in inbox/proposed: ${id}.md" >&2
+    exit 1
+  fi
+  mv "$src" "$STATE_DIR/jobs/approved/${id}.md"
+  echo "✅ approved: $id"
+}
+
+cmd_run() {
+  must_state
+  local id="${1:-}"
+  if [ -z "$id" ]; then
+    echo "❌ usage: zenny run <id>" >&2
+    exit 1
+  fi
+  local job="$STATE_DIR/jobs/approved/${id}.md"
+  if [ ! -f "$job" ]; then
+    echo "⛔ REFUSED: job not approved. Put ${id}.md in jobs/approved/ first." >&2
+    exit 2
+  fi
+
+  ts="$(date +%F_%H%M%S)"
+  bundle="$STATE_DIR/artifacts/bundles/${id}-${ts}"
+  mkdir -p "$bundle"
+  cp "$job" "$bundle/job.md"
+
+  cat > "$bundle/README.md" <<TXT
+Evidence bundle: ${id}-${ts}
+
+This is a placeholder runner.
+Future: this will orchestrate propose/review/execute and record:
+- commands run
+- diffs
+- outputs
+- verification steps
+TXT
+
+  echo "✅ created evidence bundle: $bundle"
+  echo "⚠️  Runner not implemented yet (by design)."
+}
+
+main() {
+  case "${1:-}" in
+    status) shift; cmd_status "$@";;
+    jobs)
+      shift
+      case "${1:-}" in
+        list) shift; cmd_jobs_list "$@";;
+        new) shift; cmd_jobs_new "$@";;
+        approve) shift; cmd_jobs_approve "$@";;
+        *) usage; exit 1;;
+      esac
+      ;;
+    run) shift; cmd_run "$@";;
+    -h|--help|"") usage;;
+    *) echo "❌ unknown command: $1" >&2; usage; exit 1;;
+  esac
+}
+
+main "$@"
