@@ -1,10 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_DIR="${DOBBY_STATE_DIR:-/media/zen/AI/zenny-operator/state}"
+# zenny - minimal approval-gated job runner
+#
+# Env:
+#   DOBBY_STATE_DIR   (default: /media/zen/AI/zenny-operator/state)
+#
+# Commands:
+#   zenny status
+#   zenny doctor
+#   zenny jobs list
+#   zenny jobs new <id> <title>
+#   zenny jobs approve <id>
+#   zenny jobs done <id>
+#   zenny run <id>               (creates evidence bundle)
+#
+# Bundles:
+#   zenny bundle list <id>
+#   zenny bundle latest <id>     (prints full path)
+#   zenny bundle plan <id|bundle_dir>
+#   zenny bundle cmd  <id|bundle_dir>
+#   zenny bundle arm  <id|bundle_dir>
+#   zenny bundle exec <id|bundle_dir>   (runs commands.sh only if armed)
+#   zenny bundle log  <id|bundle_dir>   (tails newest run log)
+#   zenny bundle open <id|bundle_dir>   (opens folder if possible)
+
+DEFAULT_STATE="/media/zen/AI/zenny-operator/state"
+STATE_DIR="${DOBBY_STATE_DIR:-$DEFAULT_STATE}"
+
+now_ts() { date +%F_%H%M%S; }
+
+die() { echo "❌ $*" >&2; exit 1; }
 
 usage() {
-  cat <<USAGE
+  cat <<'TXT'
 zenny - minimal approval-gated job runner
 
 Env:
@@ -12,6 +41,7 @@ Env:
 
 Commands:
   zenny status
+  zenny doctor
   zenny jobs list
   zenny jobs new <id> <title>
   zenny jobs approve <id>
@@ -20,40 +50,125 @@ Commands:
 
 Bundles:
   zenny bundle list <id>
-  zenny bundle plan <bundle_dir>
-  zenny bundle cmd  <bundle_dir>
-  zenny bundle arm  <bundle_dir>   (creates EXECUTE_OK=1 file)
-  zenny bundle exec <bundle_dir>   (runs commands.sh only if armed)
+  zenny bundle latest <id>                 (prints full path)
+  zenny bundle plan <id|bundle_dir>
+  zenny bundle cmd  <id|bundle_dir>
+  zenny bundle arm  <id|bundle_dir>        (creates EXECUTE_OK file)
+  zenny bundle exec <id|bundle_dir>        (runs commands.sh only if armed)
+  zenny bundle log  <id|bundle_dir>        (tails newest run log)
+  zenny bundle open <id|bundle_dir>        (opens folder if possible)
 
 Notes:
 - No secrets in artifacts/logs.
 - Execution is opt-in and requires arming a specific bundle.
-USAGE
+TXT
+}
+
+ensure_dirs() {
+  mkdir -p "$STATE_DIR"/{jobs,artifacts} >/dev/null 2>&1 || true
+  mkdir -p "$STATE_DIR/jobs"/{inbox,proposed,approved,running,done,failed} >/dev/null 2>&1 || true
+  mkdir -p "$STATE_DIR/artifacts"/{bundles,bundles-index} >/dev/null 2>&1 || true
 }
 
 must_state() {
-  if [ ! -d "$STATE_DIR" ]; then
-    echo "❌ DOBBY_STATE_DIR not found: $STATE_DIR" >&2
-    exit 1
+  if [ -z "${STATE_DIR:-}" ]; then
+    die "STATE_DIR is empty"
   fi
-  mkdir -p "$STATE_DIR"/{jobs/{inbox,proposed,approved,running,done,failed},artifacts/{bundles,reports,patches},logs/runs}
+  ensure_dirs
 }
 
-now_ts() { date +%F_%H%M%S; }
+jobs_dir() { echo "$STATE_DIR/jobs"; }
+bundles_root() { echo "$STATE_DIR/artifacts/bundles"; }
+
+bundle_list_for_id() {
+  local id="$1"
+  ls -1 "$(bundles_root)" 2>/dev/null | rg "^${id}-" || true
+}
+
+bundle_latest_for_id() {
+  local id="$1"
+  local latest
+  latest="$(bundle_list_for_id "$id" | sort | tail -n 1 || true)"
+  [ -n "${latest:-}" ] || return 1
+  echo "$(bundles_root)/$latest"
+}
+
+bundle_dir_from_arg() {
+  local arg="${1:-}"
+  [ -n "$arg" ] || return 1
+
+  # If arg is an existing directory, accept it.
+  if [ -d "$arg" ]; then
+    echo "$arg"
+    return 0
+  fi
+
+  # If arg looks like an absolute bundle path but doesn't exist, still return it.
+  if [[ "$arg" == /*/bundles/* ]]; then
+    echo "$arg"
+    return 0
+  fi
+
+  # Otherwise treat as job id -> latest bundle
+  local b
+  b="$(bundle_latest_for_id "$arg" 2>/dev/null || true)"
+  [ -n "${b:-}" ] || return 2
+  echo "$b"
+}
+
+editor_cmd() {
+  # Prefer $EDITOR, fallback nano, then micro, then vi, then sed hack warning.
+  if [ -n "${EDITOR:-}" ] && command -v "$EDITOR" >/dev/null 2>&1; then
+    echo "$EDITOR"
+    return 0
+  fi
+  for e in nano micro vi; do
+    if command -v "$e" >/dev/null 2>&1; then
+      echo "$e"
+      return 0
+    fi
+  done
+  echo ""  # none
+}
 
 cmd_status() {
   must_state
   echo "STATE_DIR=$STATE_DIR"
   for d in inbox proposed approved running done failed; do
-    c=$(find "$STATE_DIR/jobs/$d" -maxdepth 1 -type f 2>/dev/null | wc -l | tr -d ' ')
-    echo "jobs/$d: $c"
+    local p="$STATE_DIR/jobs/$d"
+    local n="0"
+    if [ -d "$p" ]; then
+      n="$(ls -1 "$p" 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    echo "jobs/$d: $n"
+  done
+}
+
+cmd_doctor() {
+  must_state
+  echo "STATE_DIR=$STATE_DIR"
+  echo "bundles_root=$(bundles_root)"
+  echo "jobs_dir=$(jobs_dir)"
+  echo
+  echo "dirs:"
+  for p in \
+    "$STATE_DIR" \
+    "$(jobs_dir)" \
+    "$(jobs_dir)/inbox" \
+    "$(jobs_dir)/approved" \
+    "$(bundles_root)"; do
+    if [ -d "$p" ]; then
+      echo "  ✅ $p"
+    else
+      echo "  ❌ $p (missing)"
+    fi
   done
 }
 
 cmd_jobs_list() {
   must_state
   for d in inbox proposed approved running done failed; do
-    echo "== $d =="
+    echo "== jobs/$d =="
     ls -1 "$STATE_DIR/jobs/$d" 2>/dev/null || true
     echo
   done
@@ -63,126 +178,75 @@ cmd_jobs_new() {
   must_state
   local id="${1:-}"; shift || true
   local title="${*:-}"
-  if [ -z "$id" ] || [ -z "$title" ]; then
-    echo "❌ usage: zenny jobs new <id> <title>" >&2
-    exit 1
-  fi
+  [ -n "$id" ] || die "usage: zenny jobs new <id> <title>"
+  [ -n "$title" ] || title="(no title)"
+
   local f="$STATE_DIR/jobs/inbox/${id}.md"
   if [ -e "$f" ]; then
-    echo "❌ job already exists: $f" >&2
-    exit 1
+    die "job already exists: $f"
   fi
   cat > "$f" <<MD
-# Job ${id} — ${title}
+# Job $id — $title
 
-Goal:
+Goal: TBD
 
 Rules:
-- Propose only unless approved.
-- No marketplace installs.
-- No secrets in logs/artifacts.
-
-Deliverables:
-
-Notes:
+- Propose only unless explicitly approved.
+- No marketplace installs; no third-party skills/extensions.
+- Code and state must be separated.
+- Propose → Review → Approve → Execute → Log
 MD
   echo "✅ created: $f"
-}
-
-find_job_src() {
-  local id="$1"
-  local src=""
-  for d in inbox proposed approved running done failed; do
-    if [ -f "$STATE_DIR/jobs/$d/${id}.md" ]; then
-      src="$STATE_DIR/jobs/$d/${id}.md"
-      break
-    fi
-  done
-  echo "$src"
 }
 
 cmd_jobs_approve() {
   must_state
   local id="${1:-}"
-  if [ -z "$id" ]; then
-    echo "❌ usage: zenny jobs approve <id>" >&2
-    exit 1
-  fi
-  local src=""
-  for d in inbox proposed; do
-    if [ -f "$STATE_DIR/jobs/$d/${id}.md" ]; then
-      src="$STATE_DIR/jobs/$d/${id}.md"
-      break
-    fi
-  done
-  if [ -z "$src" ]; then
-    echo "❌ job not found in inbox/proposed: ${id}.md" >&2
-    exit 1
-  fi
-  mv "$src" "$STATE_DIR/jobs/approved/${id}.md"
+  [ -n "$id" ] || die "usage: zenny jobs approve <id>"
+  local src="$STATE_DIR/jobs/inbox/${id}.md"
+  local dst="$STATE_DIR/jobs/approved/${id}.md"
+  [ -f "$src" ] || die "job not found in inbox: $src"
+  mv "$src" "$dst"
   echo "✅ approved: $id"
 }
 
 cmd_jobs_done() {
   must_state
   local id="${1:-}"
-  if [ -z "$id" ]; then
-    echo "❌ usage: zenny jobs done <id>" >&2
-    exit 1
-  fi
+  [ -n "$id" ] || die "usage: zenny jobs done <id>"
   local src="$STATE_DIR/jobs/approved/${id}.md"
-  if [ ! -f "$src" ]; then
-    echo "❌ job not found in approved: ${id}.md" >&2
-    exit 1
-  fi
-  mv "$src" "$STATE_DIR/jobs/done/${id}.md"
+  local dst="$STATE_DIR/jobs/done/${id}.md"
+  [ -f "$src" ] || die "job not found in approved: $src"
+  mv "$src" "$dst"
   echo "✅ done: $id"
-}
-
-bundle_dir_from_arg() {
-  local b="${1:-}"
-  if [ -z "$b" ]; then
-    echo "❌ bundle dir required" >&2
-    exit 1
-  fi
-  if [[ "$b" != /* ]]; then
-    b="$PWD/$b"
-  fi
-  echo "$b"
 }
 
 cmd_run() {
   must_state
   local id="${1:-}"
-  if [ -z "$id" ]; then
-    echo "❌ usage: zenny run <id>" >&2
-    exit 1
-  fi
+  [ -n "$id" ] || die "usage: zenny run <id>"
 
   local job="$STATE_DIR/jobs/approved/${id}.md"
-  if [ ! -f "$job" ]; then
-    echo "⛔ REFUSED: job not approved. Put ${id}.md in jobs/approved/ first." >&2
-    exit 2
-  fi
+  [ -f "$job" ] || die "job not approved yet (missing): $job"
 
-  local ts; ts="$(now_ts)"
-  local bundle="$STATE_DIR/artifacts/bundles/${id}-${ts}"
-  mkdir -p "$bundle"/{outputs,inputs}
+  local bundle="$STATE_DIR/artifacts/bundles/${id}-$(now_ts)"
+  mkdir -p "$bundle"/{inputs,outputs}
+
   cp "$job" "$bundle/job.md"
-
   cat > "$bundle/README.md" <<TXT
-Evidence bundle: ${id}-${ts}
+Bundle for job $id
 
-This bundle is the unit of execution.
-- plan.md: human-readable plan
-- commands.sh: generated commands (optional)
-- EXECUTE_OK: required to run commands.sh
+Files:
+- job.md: approved job
+- plan.md: human-confirmed plan
+- commands.sh: commands to run (idempotent preferred)
+- EXECUTE_OK: arming file
+- inputs/: optional input files
 - outputs/: logs and command outputs
 TXT
 
-  # stub plan + commands
   cat > "$bundle/plan.md" <<'MD'
-# Plan (stub)
+# Plan
 
 Describe:
 - what will change
@@ -194,83 +258,115 @@ MD
   cat > "$bundle/commands.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-# Commands go here. Keep them idempotent when possible.
-echo "No commands yet."
+echo "Hello from Zenny runner"
+date
+uname -a
 SH
   chmod +x "$bundle/commands.sh"
 
   echo "✅ created evidence bundle: $bundle"
-  echo "Next:"
-  echo "  zenny bundle plan $bundle   # edit/confirm plan"
+  echo "Easy path:"
   echo "  zenny bundle cmd  $bundle   # edit commands"
-  echo "  zenny bundle arm  $bundle   # require explicit arming"
-  echo "  zenny bundle exec $bundle   # execute commands.sh (armed only)"
+  echo "  zenny bundle arm  $bundle   # arm"
+  echo "  zenny bundle exec $bundle   # execute"
 }
 
 cmd_bundle_list() {
   must_state
   local id="${1:-}"
-  if [ -z "$id" ]; then
-    echo "❌ usage: zenny bundle list <id>" >&2
-    exit 1
-  fi
-  ls -1 "$STATE_DIR/artifacts/bundles" | rg "^${id}-" || true
+  [ -n "$id" ] || die "usage: zenny bundle list <id>"
+  bundle_list_for_id "$id"
+}
+
+cmd_bundle_latest() {
+  must_state
+  local id="${1:-}"
+  [ -n "$id" ] || die "usage: zenny bundle latest <id>"
+  local b
+  b="$(bundle_latest_for_id "$id" || true)"
+  [ -n "${b:-}" ] || die "no bundles found for job: $id"
+  echo "$b"
 }
 
 cmd_bundle_plan() {
   must_state
-  local b; b="$(bundle_dir_from_arg "${1:-}")"
-  if [ ! -d "$b" ]; then
-    echo "❌ bundle not found: $b" >&2
-    exit 1
-  fi
-  ${EDITOR:-nano} "$b/plan.md"
+  local b; b="$(bundle_dir_from_arg "${1:-}")" || die "bundle dir required (or valid job id)"
+  [ -d "$b" ] || die "bundle not found: $b"
+  local ed; ed="$(editor_cmd)"
+  [ -n "$ed" ] || die "no editor found (install nano or set EDITOR)"
+  "$ed" "$b/plan.md"
 }
 
 cmd_bundle_cmd() {
   must_state
-  local b; b="$(bundle_dir_from_arg "${1:-}")"
-  if [ ! -d "$b" ]; then
-    echo "❌ bundle not found: $b" >&2
-    exit 1
-  fi
-  ${EDITOR:-nano} "$b/commands.sh"
+  local b; b="$(bundle_dir_from_arg "${1:-}")" || die "bundle dir required (or valid job id)"
+  [ -d "$b" ] || die "bundle not found: $b"
+  local ed; ed="$(editor_cmd)"
+  [ -n "$ed" ] || die "no editor found (install nano or set EDITOR)"
+  "$ed" "$b/commands.sh"
   chmod +x "$b/commands.sh" || true
 }
 
 cmd_bundle_arm() {
   must_state
-  local b; b="$(bundle_dir_from_arg "${1:-}")"
-  if [ ! -d "$b" ]; then
-    echo "❌ bundle not found: $b" >&2
-    exit 1
-  fi
+  local b; b="$(bundle_dir_from_arg "${1:-}")" || die "bundle dir required (or valid job id)"
+  [ -d "$b" ] || die "bundle not found: $b"
   echo "EXECUTE_OK=1" > "$b/EXECUTE_OK"
   echo "✅ armed bundle: $b"
 }
 
 cmd_bundle_exec() {
   must_state
-  local b; b="$(bundle_dir_from_arg "${1:-}")"
-  if [ ! -d "$b" ]; then
-    echo "❌ bundle not found: $b" >&2
-    exit 1
-  fi
+  local b; b="$(bundle_dir_from_arg "${1:-}")" || die "bundle dir required (or valid job id)"
+  [ -d "$b" ] || die "bundle not found: $b"
+
   if [ ! -f "$b/EXECUTE_OK" ]; then
-    echo "⛔ REFUSED: bundle not armed. Run: zenny bundle arm $b" >&2
-    exit 2
+    die "REFUSED: bundle not armed. Run: zenny bundle arm $b"
   fi
 
+  mkdir -p "$b/outputs"
   local out="$b/outputs/run-$(now_ts).log"
+
   echo "▶ executing $b/commands.sh"
   echo "log: $out"
+
+  if [ ! -f "$b/commands.sh" ]; then
+    die "commands.sh missing in bundle: $b"
+  fi
+
   (cd "$b" && ./commands.sh) 2>&1 | tee "$out"
   echo "✅ done"
+}
+
+cmd_bundle_log() {
+  must_state
+  local b; b="$(bundle_dir_from_arg "${1:-}")" || die "bundle dir required (or valid job id)"
+  [ -d "$b" ] || die "bundle not found: $b"
+  if [ ! -d "$b/outputs" ]; then
+    die "no outputs/ yet (run exec first): $b"
+  fi
+  local last
+  last="$(ls -1 "$b/outputs"/run-*.log 2>/dev/null | sort | tail -n 1 || true)"
+  [ -n "${last:-}" ] || die "no run logs found in outputs/: $b"
+  tail -n 200 "$last"
+}
+
+cmd_bundle_open() {
+  must_state
+  local b; b="$(bundle_dir_from_arg "${1:-}")" || die "bundle dir required (or valid job id)"
+  [ -d "$b" ] || die "bundle not found: $b"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$b" >/dev/null 2>&1 || true
+    echo "✅ opened: $b"
+  else
+    echo "$b"
+  fi
 }
 
 main() {
   case "${1:-}" in
     status) shift; cmd_status "$@";;
+    doctor) shift; cmd_doctor "$@";;
     jobs)
       shift
       case "${1:-}" in
@@ -286,10 +382,13 @@ main() {
       shift
       case "${1:-}" in
         list) shift; cmd_bundle_list "$@";;
+        latest) shift; cmd_bundle_latest "$@";;
         plan) shift; cmd_bundle_plan "$@";;
         cmd) shift; cmd_bundle_cmd "$@";;
         arm) shift; cmd_bundle_arm "$@";;
         exec) shift; cmd_bundle_exec "$@";;
+        log) shift; cmd_bundle_log "$@";;
+        open) shift; cmd_bundle_open "$@";;
         *) usage; exit 1;;
       esac
       ;;
