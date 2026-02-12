@@ -1,21 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-STATE_DIR="${DOBBY_STATE_DIR:-/media/zen/AI/dobby-operator/state}"
+STATE_DIR="${DOBBY_STATE_DIR:-/media/zen/AI/zenny-operator/state}"
 
 usage() {
   cat <<USAGE
-zenny - minimal job gate
+zenny - minimal approval-gated job runner
 
 Env:
-  DOBBY_STATE_DIR   (default: /media/zen/AI/dobby-operator/state)
+  DOBBY_STATE_DIR   (default: /media/zen/AI/zenny-operator/state)
 
 Commands:
   zenny status
   zenny jobs list
   zenny jobs new <id> <title>
   zenny jobs approve <id>
-  zenny run <id>    (refuses unless approved)
+  zenny jobs done <id>
+  zenny run <id>               (creates evidence bundle; does not execute)
+
+Bundles:
+  zenny bundle list <id>
+  zenny bundle plan <bundle_dir>
+  zenny bundle cmd  <bundle_dir>
+  zenny bundle arm  <bundle_dir>   (creates EXECUTE_OK=1 file)
+  zenny bundle exec <bundle_dir>   (runs commands.sh only if armed)
+
+Notes:
+- No secrets in artifacts/logs.
+- Execution is opt-in and requires arming a specific bundle.
 USAGE
 }
 
@@ -26,6 +38,8 @@ must_state() {
   fi
   mkdir -p "$STATE_DIR"/{jobs/{inbox,proposed,approved,running,done,failed},artifacts/{bundles,reports,patches},logs/runs}
 }
+
+now_ts() { date +%F_%H%M%S; }
 
 cmd_status() {
   must_state
@@ -47,8 +61,7 @@ cmd_jobs_list() {
 
 cmd_jobs_new() {
   must_state
-  local id="${1:-}"
-  shift || true
+  local id="${1:-}"; shift || true
   local title="${*:-}"
   if [ -z "$id" ] || [ -z "$title" ]; then
     echo "❌ usage: zenny jobs new <id> <title>" >&2
@@ -76,6 +89,18 @@ MD
   echo "✅ created: $f"
 }
 
+find_job_src() {
+  local id="$1"
+  local src=""
+  for d in inbox proposed approved running done failed; do
+    if [ -f "$STATE_DIR/jobs/$d/${id}.md" ]; then
+      src="$STATE_DIR/jobs/$d/${id}.md"
+      break
+    fi
+  done
+  echo "$src"
+}
+
 cmd_jobs_approve() {
   must_state
   local id="${1:-}"
@@ -98,6 +123,34 @@ cmd_jobs_approve() {
   echo "✅ approved: $id"
 }
 
+cmd_jobs_done() {
+  must_state
+  local id="${1:-}"
+  if [ -z "$id" ]; then
+    echo "❌ usage: zenny jobs done <id>" >&2
+    exit 1
+  fi
+  local src="$STATE_DIR/jobs/approved/${id}.md"
+  if [ ! -f "$src" ]; then
+    echo "❌ job not found in approved: ${id}.md" >&2
+    exit 1
+  fi
+  mv "$src" "$STATE_DIR/jobs/done/${id}.md"
+  echo "✅ done: $id"
+}
+
+bundle_dir_from_arg() {
+  local b="${1:-}"
+  if [ -z "$b" ]; then
+    echo "❌ bundle dir required" >&2
+    exit 1
+  fi
+  if [[ "$b" != /* ]]; then
+    b="$PWD/$b"
+  fi
+  echo "$b"
+}
+
 cmd_run() {
   must_state
   local id="${1:-}"
@@ -105,30 +158,114 @@ cmd_run() {
     echo "❌ usage: zenny run <id>" >&2
     exit 1
   fi
+
   local job="$STATE_DIR/jobs/approved/${id}.md"
   if [ ! -f "$job" ]; then
     echo "⛔ REFUSED: job not approved. Put ${id}.md in jobs/approved/ first." >&2
     exit 2
   fi
 
-  ts="$(date +%F_%H%M%S)"
-  bundle="$STATE_DIR/artifacts/bundles/${id}-${ts}"
-  mkdir -p "$bundle"
+  local ts; ts="$(now_ts)"
+  local bundle="$STATE_DIR/artifacts/bundles/${id}-${ts}"
+  mkdir -p "$bundle"/{outputs,inputs}
   cp "$job" "$bundle/job.md"
 
   cat > "$bundle/README.md" <<TXT
 Evidence bundle: ${id}-${ts}
 
-This is a placeholder runner.
-Future: this will orchestrate propose/review/execute and record:
-- commands run
-- diffs
-- outputs
-- verification steps
+This bundle is the unit of execution.
+- plan.md: human-readable plan
+- commands.sh: generated commands (optional)
+- EXECUTE_OK: required to run commands.sh
+- outputs/: logs and command outputs
 TXT
 
+  # stub plan + commands
+  cat > "$bundle/plan.md" <<'MD'
+# Plan (stub)
+
+Describe:
+- what will change
+- why
+- safety checks
+- verification steps
+MD
+
+  cat > "$bundle/commands.sh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+# Commands go here. Keep them idempotent when possible.
+echo "No commands yet."
+SH
+  chmod +x "$bundle/commands.sh"
+
   echo "✅ created evidence bundle: $bundle"
-  echo "⚠️  Runner not implemented yet (by design)."
+  echo "Next:"
+  echo "  zenny bundle plan $bundle   # edit/confirm plan"
+  echo "  zenny bundle cmd  $bundle   # edit commands"
+  echo "  zenny bundle arm  $bundle   # require explicit arming"
+  echo "  zenny bundle exec $bundle   # execute commands.sh (armed only)"
+}
+
+cmd_bundle_list() {
+  must_state
+  local id="${1:-}"
+  if [ -z "$id" ]; then
+    echo "❌ usage: zenny bundle list <id>" >&2
+    exit 1
+  fi
+  ls -1 "$STATE_DIR/artifacts/bundles" | rg "^${id}-" || true
+}
+
+cmd_bundle_plan() {
+  must_state
+  local b; b="$(bundle_dir_from_arg "${1:-}")"
+  if [ ! -d "$b" ]; then
+    echo "❌ bundle not found: $b" >&2
+    exit 1
+  fi
+  ${EDITOR:-nano} "$b/plan.md"
+}
+
+cmd_bundle_cmd() {
+  must_state
+  local b; b="$(bundle_dir_from_arg "${1:-}")"
+  if [ ! -d "$b" ]; then
+    echo "❌ bundle not found: $b" >&2
+    exit 1
+  fi
+  ${EDITOR:-nano} "$b/commands.sh"
+  chmod +x "$b/commands.sh" || true
+}
+
+cmd_bundle_arm() {
+  must_state
+  local b; b="$(bundle_dir_from_arg "${1:-}")"
+  if [ ! -d "$b" ]; then
+    echo "❌ bundle not found: $b" >&2
+    exit 1
+  fi
+  echo "EXECUTE_OK=1" > "$b/EXECUTE_OK"
+  echo "✅ armed bundle: $b"
+}
+
+cmd_bundle_exec() {
+  must_state
+  local b; b="$(bundle_dir_from_arg "${1:-}")"
+  if [ ! -d "$b" ]; then
+    echo "❌ bundle not found: $b" >&2
+    exit 1
+  fi
+  if [ ! -f "$b/EXECUTE_OK" ]; then
+    echo "⛔ REFUSED: bundle not armed. Run: zenny bundle arm $b" >&2
+    exit 2
+  fi
+
+  local out="$b/outputs/run-$(now_ts).log"
+  echo "▶ executing $b/commands.sh"
+  echo "log: $out"
+  (cd "$b" && ./commands.sh) 2>&1 | tee "$out"
+  echo "✅ done"
 }
 
 main() {
@@ -140,12 +277,24 @@ main() {
         list) shift; cmd_jobs_list "$@";;
         new) shift; cmd_jobs_new "$@";;
         approve) shift; cmd_jobs_approve "$@";;
+        done) shift; cmd_jobs_done "$@";;
         *) usage; exit 1;;
       esac
       ;;
     run) shift; cmd_run "$@";;
+    bundle)
+      shift
+      case "${1:-}" in
+        list) shift; cmd_bundle_list "$@";;
+        plan) shift; cmd_bundle_plan "$@";;
+        cmd) shift; cmd_bundle_cmd "$@";;
+        arm) shift; cmd_bundle_arm "$@";;
+        exec) shift; cmd_bundle_exec "$@";;
+        *) usage; exit 1;;
+      esac
+      ;;
     -h|--help|"") usage;;
-    *) echo "❌ unknown command: $1" >&2; usage; exit 1;;
+    *) echo "❌ unknown command: ${1:-}" >&2; usage; exit 1;;
   esac
 }
 
